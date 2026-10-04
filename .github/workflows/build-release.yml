@@ -1,0 +1,157 @@
+# 打包 Windows(NSIS) + macOS(dmg/zip 双架构),产物统一由 release job 汇总发布
+# 本 workflow 跑在公开发版仓库 kam-release(公开仓库 Actions 免费,含 macOS runner),
+# 源码用 SOURCE_REPO_TOKEN 从私有仓库拉取;发布用本仓库自己的 GITHUB_TOKEN,目标即本仓库。
+# 触发:Actions → Build & Release → Run workflow,或 gh workflow run build-release.yml -R fanxuankai/kam-release
+# 标签取源码 package.json 版本(v{version});构建成功即发布正式 Release 并设为 latest,在线更新立即可见
+# Secrets: SOURCE_REPO_TOKEN — 可读私有源码仓库的 token(Contents:read)。失效时
+#   (checkout 报 404/not Found)在本机重灌:gh auth token | gh secret set SOURCE_REPO_TOKEN -R fanxuankai/kam-release
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "源码仓库要构建的 ref(分支/tag/SHA)"
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: build-app-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: fanxuankai/Kiro-account-manager
+
+jobs:
+  build-windows:
+    name: Windows (NSIS x64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # 帮 node-gyp 定位 runner 上的 VS2022 C++ 工具链(如需源码重编译)
+      GYP_MSVS_VERSION: "2022"
+    defaults:
+      run:
+        working-directory: Kiro-account-manager
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Kiro-account-manager/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # hy2(Hysteria2)代理桥内核:按平台下载进 extraResources 一起打包
+      - name: Fetch sing-box kernel
+        run: node scripts/fetch-singbox.mjs
+
+      # 只打包不发布:发布统一由 release job 做,避免多 job 各建 Release 互相分裂
+      - name: Build (Windows)
+        run: npm run build:win -- --publish never
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: |
+            Kiro-account-manager/dist/*-setup.exe
+            Kiro-account-manager/dist/*-setup.exe.blockmap
+            Kiro-account-manager/dist/latest.yml
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS (dmg/zip x64+arm64)
+    # macos-14 ARM runner 打 x64 dmg 时 hdiutil 偶发/连续 "Device not configured"
+    # (2026-09-18 起稳定复现,同配置本地与 macos-15 正常);换 macos-15 镜像规避
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: Kiro-account-manager
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Kiro-account-manager/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch sing-box kernel
+        run: node scripts/fetch-singbox.mjs
+
+      - name: Build (macOS)
+        run: npm run build:mac -- --publish never
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            Kiro-account-manager/dist/*.dmg
+            Kiro-account-manager/dist/*.dmg.blockmap
+            Kiro-account-manager/dist/*-mac.zip
+            Kiro-account-manager/dist/*-mac.zip.blockmap
+            Kiro-account-manager/dist/latest-mac.yml
+          if-no-files-found: error
+
+  # 唯一的发布入口:汇总两个平台的产物,一次性发布正式 Release(无并发分裂)。
+  # 不用 --generate-notes:那会基于本仓库自己的提交历史生成,没有内容且绝不
+  # 触碰私有仓库提交信息,统一用固定说明文案
+  release:
+    name: Publish Release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Resolve version
+        id: ver
+        run: echo "version=$(jq -r .version Kiro-account-manager/package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.ver.outputs.version }}" artifacts/* \
+            -R fanxuankai/kam-release \
+            --latest \
+            --title "v${{ steps.ver.outputs.version }}" \
+            --notes "下载对应平台安装包:
+
+          - Windows: \`kiro-account-manager-${{ steps.ver.outputs.version }}-x64-setup.exe\`
+          - macOS Apple Silicon: \`*-arm64.dmg\` / Intel: \`*-x64.dmg\`
+
+          macOS 应用未签名,首次运行如被 Gatekeeper 拦截,终端执行:
+          \`xattr -cr \"/Applications/Kiro Account Manager.app\"\` 后重新打开。
+
+          v1.7.95 起应用内更新指向本仓库;更早版本请手动下载安装本仓库最新版一次。"
